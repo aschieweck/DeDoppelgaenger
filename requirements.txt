@@ -2,4 +2,4 @@ imagehash
 pillow
 rawpy
 tqdm
-
+vptree

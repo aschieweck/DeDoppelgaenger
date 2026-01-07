@@ -2,34 +2,72 @@ import argparse
 import json
 import os
 import sys
-
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Any, Iterable, NewType
 
-from PIL import Image
 import rawpy
 import imagehash
+import vptree
+from PIL import Image
 from tqdm import tqdm
 
 
+class ImageHashTable:
+    def __init__(self) -> None:
+        self.__image_hashes = defaultdict(set)
+
+    @property
+    def hashes(self) -> dict[imagehash.ImageHash, set[Path]]:
+        return self.__image_hashes
+
+    def __getitem__(self, key: imagehash.ImageHash) -> set[Path]:
+        return self.__image_hashes[key]
+
+    def __setitem__(self, key: imagehash.ImageHash, values: set[Path]) -> None:
+        self.__image_hashes[key] = values
+
+    def keys(self) -> Iterable[imagehash.ImageHash]:
+        return self.__image_hashes.keys()
+
+    def items(self) -> Iterable[tuple[imagehash.ImageHash, set[Path]]]:
+        return self.__image_hashes.items()
+
+    def update(self, other: "ImageHashTable") -> None:
+        for entry_hash, entry_files in other.__image_hashes.items():
+            self.__image_hashes[entry_hash] |= entry_files
+
+    def __str__(self) -> str:
+        result = ""
+        for image_hash, files in self.__image_hashes.items():
+            result += f"{image_hash}\n"
+            for f in files:
+                result += f"    {f}\n"
+        return result
+
+
+DoppelgaengerList = NewType("DoppelgaengerList", dict[Path, set[Path]])
+
+
 RAW_EXTENSIONS = {".nef", ".cr2", ".arw", ".dng", ".orf", ".rw2"}
+EPSILON = 0.01
 
 
-def process_images(paths, threads):
-    hashes = {}
-
+def hash_images(hashes: ImageHashTable, paths: Iterable[Path], threads: int) -> ImageHashTable:
     with ThreadPoolExecutor(max_workers=threads) as executor:
-        futures = {executor.submit(process_image, path): path for path in paths}
+        futures = {executor.submit(hash_image, path): path for path in paths}
         for future in tqdm(as_completed(futures), total=len(futures), desc="Hashing images"):
             result = future.result()
             if result:
-                path, hash = result
-                hashes[path] = hash
+                image_hash, path = result
+                hashes[image_hash].add(path)
 
     return hashes
 
 
-def process_image(path):
-    ext = os.path.splitext(path)[1].lower()
+def hash_image(path: Path) -> tuple[imagehash.ImageHash, Path] | None:
+    ext = path.suffix.lower()
     image = None
     try:
         if ext not in RAW_EXTENSIONS:
@@ -40,7 +78,7 @@ def process_image(path):
             image = Image.fromarray(rgb)
 
         image_hash = imagehash.phash(image)
-        return path, image_hash
+        return image_hash, path
     except Exception:
         print(f"{path} - failed to read", file=sys.stderr)
         return None
@@ -49,105 +87,109 @@ def process_image(path):
             image.close()
 
 
-def load_hashes(json_file):
+def load_hashes(hashes: ImageHashTable, json_file: Path) -> ImageHashTable:
     with open(json_file, "r") as f:
         raw = json.load(f)
-    return {fname: imagehash.hex_to_hash(h) for fname, h in raw.items()}
+
+    for image_hash_str, files in raw.items():
+        image_hash = imagehash.hex_to_hash(image_hash_str)
+        files_set = {Path(f) for f in files}
+        hashes[image_hash] = set(files_set)
+    return hashes
 
 
-def gather_hashes(inputs, threads):
-    hashes = {}
+def collect_hashes(paths: Iterable[Path], threads: int) -> ImageHashTable:
+    hashes = ImageHashTable()
 
     # Collect all image files and JSON inputs
     image_files = []
-    for input in inputs:
-        if os.path.isdir(input):
-            for root, _, files in os.walk(input):
+    for path in paths:
+        if path.is_dir():
+            for root, _, files in os.walk(path):
                 for name in files:
-                    image_files.append(os.path.join(root, name))
-        elif input.endswith(".json"):
-            hashes.update(load_hashes(input))
+                    image_files.append(Path(root) / name)
+        elif path.suffix == ".json":
+            load_hashes(hashes, path)
         else:
-            print(f"Skipping unsupported input: {input}", file=sys.stderr)
+            print(f"Skipping unsupported input: {path}", file=sys.stderr)
 
     # Process image files
     if image_files:
-        hashes.update(process_images(image_files, threads))
+        hash_images(hashes, image_files, threads)
 
     return hashes
 
 
-def find_doppelgaenger(reference_hashes, target_hashes, max_distance):
-    doppelgaenger = {}
-    candidates_count = len(reference_hashes) * len(target_hashes)
-    progress_bar = tqdm(desc="Searching for matches", total=candidates_count)
-    for reference_filename, reference_hash in reference_hashes.items():
-        matches = []
-        for filename, hash in target_hashes.items():
-            progress_bar.update()
-            dist = reference_hash - hash # Hamming distance
-            if dist <= max_distance:
-                matches.append(filename)
-        if matches:
-            doppelgaenger[reference_filename] = matches
+def find_doppelgaenger(
+    reference_hashes: ImageHashTable, target_hashes: ImageHashTable, max_distance: int
+) -> DoppelgaengerList:
+    tree_hashes = list(target_hashes.keys())
+    tree = tree = vptree.VPTree(tree_hashes, lambda a, b: b - a)
 
-    progress_bar.close()
+    doppelgaenger = DoppelgaengerList({})
+    for reference_hash, reference_filenames in tqdm(reference_hashes.items(), desc="Searching for matches"):
+        matches = tree.get_all_in_range(reference_hash, max_distance + EPSILON)
+
+        if matches:
+            all_matching_files = set()
+            for _, matched_hash in matches:
+                all_matching_files |= target_hashes[matched_hash]
+
+            for reference_filename in reference_filenames:
+                doppelgaenger[reference_filename] = all_matching_files
+
     return doppelgaenger
 
 
-def get_cli_parser():
+def get_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Image hashing & duplicate finder tool.")
+    parser.add_argument("-o", "--output", type=Path, help="Optional output file (JSON). If omitted, writes to stdout.")
+    parser.add_argument("--only-hash", action="store_true", help="Stop after hash calculation and output merged hashes")
+    parser.add_argument("-t", "--threads", type=int, default=4, help="Number of worker threads (default: 4)")
+    parser.add_argument("-d", "--distance", type=int, default=0, help="Max Hamming distance (default: 0 = exact match)")
     parser.add_argument(
-        "-o", "--output",
-        help="Optional output file (JSON). If omitted, writes to stdout."
+        "-r", "--reference", action="append", required=True, type=Path, help="Reference JSON/folder (can be repeated)"
     )
-    parser.add_argument(
-        "--only-hash", action="store_true",
-        help="Stop after hash calculation and output merged hashes"
-    )
-    parser.add_argument(
-        "-t", "--threads", type=int, default=4,
-        help="Number of worker threads (default: 4)"
-    )
-    parser.add_argument(
-        "-d", "--distance", type=int, default=0,
-        help="Max Hamming distance (default: 0 = exact match)"
-    )
-    parser.add_argument(
-        "-r", "--reference", action="append", required=True,
-        help="Reference JSON/folder (can be repeated)"
-    )
-    parser.add_argument(
-        "inputs", nargs="+", help="Folders/JSON files to compare against"
-    )
+    parser.add_argument("inputs", nargs="+", type=Path, help="Folders/JSON files to compare against")
     return parser
 
 
-def handle_output(content, dest):
-    try: 
-        out = open(dest, "w") if dest else sys.stdout
-        json.dump(content, out)
-    finally:
-        if dest:
-            out.close()
+def json_encoder(obj: imagehash.ImageHash | Path | set) -> str | list:
+    if isinstance(obj, (imagehash.ImageHash, Path)):
+        return str(obj)
+    elif isinstance(obj, set):
+        return list(obj)
+    else:
+        raise TypeError
 
 
-def output_hashes(reference_hashes, target_hashes, dest):
-    merged = {}
+def handle_output(content: Any, dest: Path | None) -> None:
+    if isinstance(content, dict):
+        content = {str(k): v for k, v in content.items()}
+
+    if dest:
+        with open(dest, "w") as out:
+            json.dump(content, out, default=json_encoder)
+    else:
+        json.dump(content, sys.stdout, default=json_encoder)
+
+
+def output_hashes(reference_hashes: ImageHashTable, target_hashes: ImageHashTable, dest: Path) -> None:
+    merged = ImageHashTable()
     for k, v in reference_hashes.items():
-        merged[k] = str(v)
+        merged[k] = v
     for k, v in target_hashes.items():
-        merged[k] = str(v)
+        merged[k] |= v
 
-    handle_output(merged, dest)
+    handle_output(merged.hashes, dest)
 
 
-def main():
+def main() -> None:
     try:
         args = get_cli_parser().parse_args()
 
-        reference_hashes = gather_hashes(args.reference, threads=args.threads)
-        target_hashes    = gather_hashes(args.inputs, threads=args.threads)
+        reference_hashes = collect_hashes(args.reference, threads=args.threads)
+        target_hashes = collect_hashes(args.inputs, threads=args.threads)
 
         if args.only_hash:
             output_hashes(reference_hashes, target_hashes, args.output)
@@ -167,4 +209,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
