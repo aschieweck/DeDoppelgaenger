@@ -1,6 +1,5 @@
 import argparse
 import json
-import os
 import sys
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -91,10 +90,13 @@ def load_hashes(hashes: ImageHashTable, json_file: Path) -> ImageHashTable:
     with open(json_file, "r") as f:
         raw = json.load(f)
 
-    for image_hash_str, files in raw.items():
-        image_hash = imagehash.hex_to_hash(image_hash_str)
-        files_set = {Path(f) for f in files}
-        hashes[image_hash] = set(files_set)
+    try:
+        for image_hash_str, files in raw.items():
+            image_hash = imagehash.hex_to_hash(image_hash_str)
+            files_set = {Path(f) for f in files}
+            hashes[image_hash] = set(files_set)
+    except ValueError:
+        raise ValueError(f"Could not read JSON file '{str(json_file)}'")
     return hashes
 
 
