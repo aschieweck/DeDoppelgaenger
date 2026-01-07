@@ -102,16 +102,23 @@ def collect_hashes(paths: Iterable[Path], threads: int) -> ImageHashTable:
     hashes = ImageHashTable()
 
     # Collect all image files and JSON inputs
+    json_files = []
     image_files = []
     for path in paths:
-        if path.is_dir():
-            for root, _, files in os.walk(path):
-                for name in files:
-                    image_files.append(Path(root) / name)
-        elif path.suffix == ".json":
-            load_hashes(hashes, path)
-        else:
-            print(f"Skipping unsupported input: {path}", file=sys.stderr)
+        items = path.rglob("*") if path.is_dir() else [path]
+
+        for item in items:
+            if not item.is_file():
+                continue
+
+            if item.suffix.lower() == ".json":
+                json_files.append(item)
+            else:
+                image_files.append(item)
+
+    # Process JSON files
+    for file in json_files:
+        load_hashes(hashes, file)
 
     # Process image files
     if image_files:
@@ -143,14 +150,28 @@ def find_doppelgaenger(
 
 def get_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Image hashing & duplicate finder tool.")
-    parser.add_argument("-o", "--output", type=Path, help="Optional output file (JSON). If omitted, writes to stdout.")
-    parser.add_argument("--only-hash", action="store_true", help="Stop after hash calculation and output merged hashes")
-    parser.add_argument("-t", "--threads", type=int, default=4, help="Number of worker threads (default: 4)")
-    parser.add_argument("-d", "--distance", type=int, default=0, help="Max Hamming distance (default: 0 = exact match)")
-    parser.add_argument(
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    hash_parser = subparsers.add_parser("hash", help="Just calculate the hashes of the proviced files.")
+    hash_parser.add_argument(
+        "-o", "--output", type=Path, help="Optional output file (JSON). If omitted, writes to stdout."
+    )
+    hash_parser.add_argument("-t", "--threads", type=int, default=4, help="Number of worker threads (default: 4)")
+    hash_parser.add_argument("inputs", nargs="+", type=Path, help="Folders/JSON files to compute the hashes for.")
+
+    find_parser = subparsers.add_parser("find", help="Find Doppelgaenger.")
+    find_parser.add_argument(
+        "-o", "--output", type=Path, help="Optional output file (JSON). If omitted, writes to stdout."
+    )
+    find_parser.add_argument("-t", "--threads", type=int, default=4, help="Number of worker threads (default: 4)")
+    find_parser.add_argument(
+        "-d", "--distance", type=int, default=0, help="Max Hamming distance (default: 0 = exact match)"
+    )
+    find_parser.add_argument(
         "-r", "--reference", action="append", required=True, type=Path, help="Reference JSON/folder (can be repeated)"
     )
-    parser.add_argument("inputs", nargs="+", type=Path, help="Folders/JSON files to compare against")
+    find_parser.add_argument("inputs", nargs="+", type=Path, help="Folders/JSON files to compare against")
+
     return parser
 
 
@@ -186,17 +207,20 @@ def output_hashes(reference_hashes: ImageHashTable, target_hashes: ImageHashTabl
 
 def main() -> None:
     try:
-        args = get_cli_parser().parse_args()
+        parser = get_cli_parser()
+        args = parser.parse_args()
 
-        reference_hashes = collect_hashes(args.reference, threads=args.threads)
-        target_hashes = collect_hashes(args.inputs, threads=args.threads)
+        if args.command == "hash":
+            target_hashes = collect_hashes(args.inputs, threads=args.threads)
+            output_hashes(target_hashes, target_hashes, args.output)
 
-        if args.only_hash:
-            output_hashes(reference_hashes, target_hashes, args.output)
-            return
+        elif args.command == "find":
+            reference_hashes = collect_hashes(args.reference, threads=args.threads)
+            target_hashes = collect_hashes(args.inputs, threads=args.threads)
 
-        doppelgaenger = find_doppelgaenger(reference_hashes, target_hashes, args.distance)
-        handle_output(doppelgaenger, args.output)
+            doppelgaenger = find_doppelgaenger(reference_hashes, target_hashes, args.distance)
+
+            handle_output(doppelgaenger, args.output)
 
     except KeyboardInterrupt:
         print("\nOperation cancelled by user.", file=sys.stderr)
